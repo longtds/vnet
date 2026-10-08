@@ -1,0 +1,30 @@
+[package]
+name = "vnet"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "vnet CLI and daemon"
+
+[dependencies]
+vnet-core = { path = "../vnet-core" }
+vnet-proto = { path = "../vnet-proto" }
+
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+axum.workspace = true
+serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[[bin]]
+name = "vnet"
+path = "src/main.rs"
+
+[[bin]]
+name = "vnet-cli"
+path = "src/cli.rs"
