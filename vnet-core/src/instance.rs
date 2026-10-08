@@ -140,27 +140,73 @@ impl Instance {
         // 管理 API
         crate::api::start_api(self.config.admin_port, self.peer_mgr.clone(), self.identity.clone());
 
-        // 3. STUN 探测本机 UDP 映射地址 (仅当有 udp 监听器时).
-        // 同步等待, 确保后续 connect_peer 的握手能携带 udp_mapped_addr (NAT 打洞前提);
-        // STUN 失败也不阻断启动, 仅打洞不可用.
-        if self.peer_mgr.demux.read().is_some() {
-            let demux = self.peer_mgr.demux.read().clone().unwrap();
-            let stun_server = self.config.stun_server.clone();
-            let (stun_tx, stun_rx) = mpsc::channel(16);
-            demux.set_stun_handler(stun_tx);
-            // 5s 超时, 避免 stun 服务器不可达时阻塞太久
-            let stun_res = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                crate::nat::stun::query_mapped_addr(&demux.socket, &stun_server, stun_rx),
-            ).await;
-            demux.clear_stun_handler();
-            match stun_res {
-                Ok(Ok(addr)) => {
-                    tracing::info!(%addr, "STUN mapped address");
-                    *self.peer_mgr.my_udp_mapped_addr.write() = Some(addr.to_string());
+        // 3. STUN 探测本机 UDP 映射地址. 等待 UDP listener 启动并注册 demux (spawn_listener 只调度不等待),
+        // 轮询最多 3s. 若超时则跳过 STUN (打洞不可用).
+        if self.config.listeners.iter().any(|l| l.starts_with("udp://")) {
+            let demux = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Some(d) = self.peer_mgr.demux.read().clone() {
+                        return d;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                Ok(Err(e)) => tracing::warn!(?e, "STUN failed"),
-                Err(_) => tracing::warn!("STUN timeout (5s), skipping"),
+            }).await;
+            match demux {
+                Ok(demux) => {
+                    let stun_server = self.config.stun_server.clone();
+                    let (stun_tx, stun_rx) = mpsc::channel(16);
+                    demux.set_stun_handler(stun_tx);
+                    let stun_res = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        crate::nat::stun::query_mapped_addr(&demux.socket, &stun_server, stun_rx),
+                    ).await;
+                    demux.clear_stun_handler();
+                    match stun_res {
+                        Ok(Ok(addr)) => {
+                            tracing::info!(%addr, "STUN mapped address");
+                            *self.peer_mgr.my_udp_mapped_addr.write() = Some(addr.to_string());
+                        }
+                        Ok(Err(e)) => tracing::warn!(?e, "STUN failed"),
+                        Err(_) => tracing::warn!("STUN timeout (5s), skipping"),
+                    }
+
+                    // 定期刷新 STUN 映射地址 (每 5min). 同之前逻辑, 略...
+                    let mgr = self.peer_mgr.clone();
+                    let stun_server_clone = self.config.stun_server.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                        tick.tick().await;
+                        loop {
+                            tick.tick().await;
+                            let (stun_tx, stun_rx) = mpsc::channel(16);
+                            demux.set_stun_handler(stun_tx);
+                            let res = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                crate::nat::stun::query_mapped_addr(&demux.socket, &stun_server_clone, stun_rx),
+                            ).await;
+                            demux.clear_stun_handler();
+                            match res {
+                                Ok(Ok(addr)) => {
+                                    let new_str = addr.to_string();
+                                    let changed = {
+                                        let cur = mgr.my_udp_mapped_addr.read();
+                                        cur.as_deref() != Some(&new_str)
+                                    };
+                                    if changed {
+                                        tracing::info!(old = ?*mgr.my_udp_mapped_addr.read(), %addr, "STUN mapped address changed, re-gossip");
+                                        *mgr.my_udp_mapped_addr.write() = Some(new_str);
+                                        let _ = mgr.broadcast_topology().await;
+                                    } else {
+                                        tracing::debug!(%addr, "STUN mapped address unchanged");
+                                    }
+                                }
+                                Ok(Err(e)) => tracing::warn!(?e, "periodic STUN failed"),
+                                Err(_) => tracing::debug!("periodic STUN timeout"),
+                            }
+                        }
+                    });
+                }
+                Err(_) => tracing::warn!("UDP listener not ready after 3s, skipping STUN"),
             }
         }
 
@@ -182,10 +228,12 @@ impl Instance {
                 let mgr = mgr.clone();
                 let tls_ca = tls_ca.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = connect_peer(&addr, &id, mgr.clone(), tls_ca).await {
+                    let result = connect_peer(&addr, &id, mgr.clone(), tls_ca).await;
+                    let success = result.is_ok();
+                    if let Err(e) = &result {
                         tracing::debug!(%addr, ?e, "connect peer failed");
                     }
-                    mgr.finish_connect_attempt(&addr);
+                    mgr.finish_connect_attempt(&addr, success);
                 });
             }
         });
@@ -204,7 +252,12 @@ impl Instance {
         self.peer_mgr
             .spawn_keepalive(std::time::Duration::from_secs(10), std::time::Duration::from_secs(60));
 
-        // 5.6 断线自动重连: 周期重试配置的 peers (已连接/连接中则跳过)
+        // 5.6 P2P 优先重试周期: 每 30s 对已有中继 peer 重新尝试 UDP 打洞.
+        // NAT 洞可能被防火墙定时回收, 持续重试确保最终 P2P 连通.
+        self.peer_mgr
+            .spawn_p2p_retry(std::time::Duration::from_secs(30));
+
+        // 5.7 断线自动重连: 周期重试配置的 peers (已连接/连接中则跳过)
         if !self.config.peers.is_empty() {
             let peers_cfg = self.config.peers.clone();
             let mgr = self.peer_mgr.clone();
