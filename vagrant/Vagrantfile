@@ -1,0 +1,44 @@
+# -*- mode: ruby -*-
+# vnet 多虚拟机测试环境 (vagrant + libvirt/kvm)
+#
+# 拓扑 (私网 192.168.56.0/24):
+#   node1 192.168.56.11  vip 10.144.144.1  --tcp-->  node2 (hub)
+#   node2 192.168.56.12  vip 10.144.144.2  (hub, 全部协议监听)
+#   node3 192.168.56.13  vip 10.144.144.3  --quic--> node2 (hub)
+#
+# 用法:
+#   cd vagrant && vagrant up        # 启动 3 台 VM
+#   ./e2e-test.sh                   # 跑端到端测试
+#   vagrant destroy -f              # 销毁
+
+Vagrant.configure("2") do |config|
+  # 与宿主 glibc 版本对齐 (宿主 2.39), 保证编译出的二进制可直接运行
+  config.vm.box = "cloud-image/ubuntu-24.04"
+
+  # 默认 /vagrant 目录禁用 (NFS 依赖), 用 rsync 同步 bin/ 下的二进制软链
+  # (默认 rsync 参数含 --copy-links, 软链会按实体文件传输)
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.synced_folder "./bin", "/opt/vnet", type: "rsync"
+
+  config.vm.provider :libvirt do |lv|
+    lv.memory = 512
+    lv.cpus = 1
+  end
+
+  nodes = [
+    { name: "node1", ip: "192.168.56.11" },
+    { name: "node2", ip: "192.168.56.12" },
+    { name: "node3", ip: "192.168.56.13" },
+  ]
+
+  nodes.each do |n|
+    config.vm.define n[:name] do |node|
+      node.vm.hostname = n[:name]
+      node.vm.network :private_network, ip: n[:ip]
+      node.vm.provision "shell", inline: <<-SHELL
+        modprobe tun || true
+        cp -f /opt/vnet/vnet /opt/vnet/vnet-cli /usr/local/bin/ 2>/dev/null || true
+      SHELL
+    end
+  end
+end

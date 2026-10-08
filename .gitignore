@@ -1,0 +1,12 @@
+.trae/
+trae/
+test/
+AGENTS.md
+
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# Vagrant VM 运行状态 (含 private_key) 与二进制软链
+vagrant/.vagrant/
+vagrant/bin/

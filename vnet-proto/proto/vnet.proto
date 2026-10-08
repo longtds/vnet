@@ -1,0 +1,91 @@
+syntax = "proto3";
+package vnet;
+
+// ========== 握手 ==========
+
+// 隧道建立时的握手消息 (明文，用于密钥交换与身份识别)
+message Handshake {
+  string network_name = 1;      // 网络名称 (组网标识)
+  bytes public_key = 2;         // X25519 临时公钥 (32 字节)
+  uint64 peer_id = 3;           // 节点 ID (由 network_secret 与公钥派生)
+  string hostname = 4;          // 主机名
+  string virtual_ip = 5;        // 虚拟 IPv4 地址, 如 "10.144.144.1"
+  uint32 version = 6;           // 协议版本
+  repeated string proxy_cidrs = 7;  // 代理子网列表, 如 "10.1.1.0/24"
+  repeated string listen_addrs = 8; // 本机监听地址, 如 "tcp://0.0.0.0:11010"; gossip 时通告这些而非连接的临时端口
+  string udp_mapped_addr = 9;   // 本机 UDP socket 经 STUN 探测得到的外网映射地址 (host:port), 用于 NAT 打洞
+}
+
+// ========== Peer 信息 ==========
+
+message PeerInfo {
+  uint64 peer_id = 1;
+  string hostname = 2;
+  string virtual_ip = 3;
+  repeated string public_addrs = 4;   // 可达地址, 如 "tcp://1.2.3.4:11010"
+  repeated string proxy_cidrs = 5;    // 代理的子网
+  int64 last_seen = 6;                // unix 秒
+  string nat_type = 7;                // NAT 类型描述
+  string udp_mapped_addr = 8;         // 该 peer 的 UDP 外网映射地址 (host:port), 用于 NAT 打洞
+}
+
+// ========== 控制消息 ==========
+
+message ControlPacket {
+  oneof msg {
+    PeerListRequest peer_list_request = 1;
+    PeerListResponse peer_list_response = 2;
+    Ping ping = 3;
+    Pong pong = 4;
+    PunchRequest punch_request = 5;
+    PunchResponse punch_response = 6;
+    RouteUpdate route_update = 7;
+  }
+}
+
+message PeerListRequest {}
+
+message PeerListResponse {
+  repeated PeerInfo peers = 1;
+}
+
+message Ping {
+  uint64 seq = 1;
+  int64 ts_ms = 2;
+}
+
+message Pong {
+  uint64 seq = 1;
+  int64 ts_ms = 2;
+}
+
+// 打洞协调: A 请中继/对端协助, 告知自己与目标的 UDP 映射地址
+message PunchRequest {
+  uint64 target_peer_id = 1;
+  string my_udp_mapped_addr = 2;
+}
+
+message PunchResponse {
+  uint64 from_peer_id = 1;
+  string peer_udp_mapped_addr = 2;
+}
+
+// 路由变更通知
+message RouteUpdate {
+  repeated PeerInfo added = 1;
+  repeated uint64 removed_peer_ids = 2;
+}
+
+// ========== 隧道数据包 (加密前明文) ==========
+
+enum PacketType {
+  DATA = 0;     // payload 为虚拟 IP 数据包
+  CONTROL = 1;  // payload 为 ControlPacket
+}
+
+message TunnelPacket {
+  uint64 from_peer = 1;
+  uint64 to_peer = 2;       // 目标 peer_id; 0 = 由路由表按目标 IP 决定
+  PacketType packet_type = 3;
+  bytes payload = 4;
+}
