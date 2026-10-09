@@ -224,4 +224,3 @@ release 构建，3×512MB 单核 VM 局域网（物理基线 ≈ 16 Gbps）：
 - 修改 `vnet-proto/proto/vnet.proto` 后无需手动生成代码（`build.rs` 构建时处理）；新增字段用新 tag 号保持向后兼容
 - parking_lot 锁守卫不要跨 `.await` 持有
 - 新增传输协议：实现 `Tunnel` trait 并复用 `handshake::do_handshake`（流式协议套 `StreamTunnel::handshake_on`），在 `instance::connect_peer` 注册 scheme 分发
-- 更多实现细节与已知坑见 [AGENTS.md](./AGENTS.md)
