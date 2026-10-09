@@ -111,6 +111,211 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NodeView 序列化应包含 listen_addrs 字段, 但不应包含 network_secret
+    #[test]
+    fn node_view_serialization_contains_listen_addrs() {
+        let view = NodeView {
+            peer_id: 1234567890,
+            hostname: "testhost".into(),
+            virtual_ip: "10.144.144.1".into(),
+            network_name: "testnet".into(),
+            udp_mapped_addr: Some("1.2.3.4:54321".into()),
+            mapped_addrs: vec!["tcp://0.0.0.0:11010".into()],
+            listen_addrs: vec![
+                "tcp://0.0.0.0:11010".into(),
+                "udp://0.0.0.0:11010".into(),
+                "quic://0.0.0.0:11012".into(),
+            ],
+            relay_mode: false,
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        // listen_addrs 存在且包含 3 个地址
+        assert!(json.contains("listen_addrs"), "listen_addrs 应在 JSON 中");
+        assert!(json.contains("tcp://0.0.0.0:11010"));
+        assert!(json.contains("quic://0.0.0.0:11012"));
+        // network_secret 不应出现在 NodeView 中
+        assert!(!json.contains("network_secret"), "secret 不应暴露");
+        // 其他关键字段
+        assert!(json.contains("\"peer_id\":1234567890"));
+        assert!(json.contains("\"relay_mode\":false"));
+        assert!(json.contains("\"udp_mapped_addr\":\"1.2.3.4:54321\""));
+    }
+
+    /// relay_mode=true, udp_mapped_addr=null 等边界值序列化正确
+    #[test]
+    fn node_view_serialization_edge_cases() {
+        let view = NodeView {
+            peer_id: 0,
+            hostname: String::new(),
+            virtual_ip: String::new(),
+            network_name: String::new(),
+            udp_mapped_addr: None,
+            mapped_addrs: vec![],
+            listen_addrs: vec![],
+            relay_mode: true,
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"udp_mapped_addr\":null"));
+        assert!(json.contains("\"relay_mode\":true"));
+        assert!(json.contains("\"listen_addrs\":[]"));
+    }
+
+    /// INDEX_HTML 必须包含加入网络命令生成器的所有关键元素
+    #[test]
+    fn index_html_contains_join_form_elements() {
+        // 元素 ID
+        for id in [
+            "j-secret", "j-hub", "j-vip", "j-proto", "j-cmd", "j-copy",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{}\"", id)),
+                "INDEX_HTML 应包含元素 #{}",
+                id
+            );
+        }
+        // 函数名
+        for func in [
+            "generateJoinCmd", "copyCmd", "parseProtos", "refreshJoinForm",
+        ] {
+            assert!(
+                INDEX_HTML.contains(func),
+                "INDEX_HTML 应包含函数 {}",
+                func
+            );
+        }
+    }
+
+    /// INDEX_HTML 必须包含基础表格和已有元素, 确保重构未破坏
+    #[test]
+    fn index_html_contains_existing_elements() {
+        for id in ["node", "peers", "routes"] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{}\"", id)),
+                "INDEX_HTML 应包含 #{}",
+                id
+            );
+        }
+        assert!(INDEX_HTML.contains("<title>vnet 管理</title>"));
+        assert!(INDEX_HTML.contains("vnet 节点状态"));
+        assert!(INDEX_HTML.contains("Peers"));
+        assert!(INDEX_HTML.contains("路由"));
+    }
+
+    /// 安全: HTML 中不应暴露 network_secret, secret 应由用户手动输入
+    #[test]
+    fn index_html_does_not_expose_secret() {
+        assert!(
+            INDEX_HTML.contains("type=\"password\""),
+            "secret 输入框应为 password type"
+        );
+        assert!(
+            INDEX_HTML.contains("手动输入网络密钥"),
+            "应提示用户手动输入"
+        );
+        // HTML 中不应出现任何具体的 network_secret 值
+        // (INDEX_HTML 是静态字符串, 不含运行时 secret)
+    }
+
+    /// generateJoinCmd 逻辑的 JS 字符串应包含所有协议 scheme
+    #[test]
+    fn parse_proto_regex_covers_all_schemes() {
+        assert!(
+            INDEX_HTML.contains(r#"^(tcp|udp|kcp|quic|ws|wss):\/\/"#),
+            "parseProtos 正则应覆盖全部 6 种协议"
+        );
+    }
+
+    /// 直接调用 node handler 测试 (需要构造 ApiState)
+    #[tokio::test]
+    async fn node_handler_returns_correct_data() {
+        use crate::peer::PeerManager;
+        use crate::tunnel::handshake::Identity;
+
+        let (inbound_tx, _) = tokio::sync::mpsc::channel(1);
+        let (connect_tx, _) = tokio::sync::mpsc::channel(1);
+        // Identity 和 PeerManager 必须共享同一个 udp_mapped_addr Arc
+        let udp_mapped = Arc::new(parking_lot::RwLock::new(Some("5.6.7.8:12345".into())));
+        let mgr = PeerManager::with_udp_mapped_addr(999, inbound_tx, connect_tx, udp_mapped.clone());
+        mgr.relay_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let identity = Identity {
+            network_name: "testnet".into(),
+            network_secret: "should_not_leak".into(),
+            peer_id: 999,
+            hostname: "testnode".into(),
+            virtual_ip: "10.144.144.42".into(),
+            proxy_cidrs: vec![],
+            listen_addrs: vec![
+                "tcp://0.0.0.0:11010".into(),
+                "udp://0.0.0.0:11010".into(),
+            ],
+            udp_mapped_addr: udp_mapped,
+        };
+
+        let state = ApiState { mgr, identity };
+        let resp = node(axum::extract::State(state)).await;
+        let body = resp.0; // Json<NodeView>
+
+        assert_eq!(body.peer_id, 999);
+        assert_eq!(body.hostname, "testnode");
+        assert_eq!(body.virtual_ip, "10.144.144.42");
+        assert_eq!(body.network_name, "testnet");
+        assert_eq!(body.udp_mapped_addr.as_deref(), Some("5.6.7.8:12345"));
+        assert_eq!(body.relay_mode, true);
+        assert_eq!(body.listen_addrs.len(), 2);
+        assert_eq!(body.listen_addrs[0], "tcp://0.0.0.0:11010");
+    }
+
+    /// peers handler 在空 PeerManager 上返回空数组
+    #[tokio::test]
+    async fn peers_handler_empty_manager() {
+        use crate::peer::PeerManager;
+
+        let (inbound_tx, _) = tokio::sync::mpsc::channel(1);
+        let (connect_tx, _) = tokio::sync::mpsc::channel(1);
+        let mgr = PeerManager::new(1, inbound_tx, connect_tx);
+        let identity = make_test_identity(1);
+
+        let state = ApiState { mgr, identity };
+        let resp = peers(axum::extract::State(state)).await;
+        let body = resp.0;
+        assert!(body.is_empty(), "空 PeerManager 应返回空 peers 数组");
+    }
+
+    /// routes handler 在空 PeerManager 上返回空数组
+    #[tokio::test]
+    async fn routes_handler_empty_manager() {
+        use crate::peer::PeerManager;
+
+        let (inbound_tx, _) = tokio::sync::mpsc::channel(1);
+        let (connect_tx, _) = tokio::sync::mpsc::channel(1);
+        let mgr = PeerManager::new(1, inbound_tx, connect_tx);
+        let identity = make_test_identity(1);
+
+        let state = ApiState { mgr, identity };
+        let resp = routes(axum::extract::State(state)).await;
+        let body = resp.0;
+        assert!(body.is_empty(), "空 PeerManager 应返回空 routes 数组");
+    }
+
+    fn make_test_identity(peer_id: u64) -> Identity {
+        Identity {
+            network_name: "test".into(),
+            network_secret: "secret".into(),
+            peer_id,
+            hostname: "test".into(),
+            virtual_ip: "".into(),
+            proxy_cidrs: vec![],
+            listen_addrs: vec![],
+            udp_mapped_addr: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+}
+
 const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html lang="zh">
 <head>

@@ -53,3 +53,4 @@ bytes.workspace = true
 rand.workspace = true
 x25519-dalek.workspace = true
 boringtun = "0.7.1"
+serde_json.workspace = true
