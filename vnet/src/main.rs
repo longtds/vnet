@@ -110,8 +110,8 @@ async fn main() -> Result<()> {
     };
 
     if cli.relay_only {
-        let mut cfg = cfg;
-        cfg.virtual_ip = None;
+        // relay-only 模式: 不需要 TUN 设备, 但保留 virtual_ip 用于 peer_id 派生
+        // (同机多节点测试时, 不同 -i 能产生不同 peer_id)
         let inst = vnet_core::Instance::new(cfg);
         tracing::info!("relay-only mode");
         inst.start_relay().await?;
